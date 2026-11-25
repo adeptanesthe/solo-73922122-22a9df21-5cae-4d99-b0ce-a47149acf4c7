@@ -9,7 +9,8 @@ from flask import Flask, jsonify, render_template, request
 
 from .core.frechet import GRID
 from .core.planner import build_plan
-from .core.sample import make_sample
+from .core.sample import make_merged_sample, make_sample
+from .core.splitter import build_split_plan
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data", "characters")
 DEFAULT_THRESHOLD = 180.0
@@ -64,6 +65,15 @@ def create_app() -> Flask:
             data = load_character(char_id)
         except FileNotFoundError:
             return jsonify({"error": "unknown character"}), 404
+        if request.args.get("merged") in ("1", "true", "yes"):
+            if len(data["strokes"]) < 2:
+                return jsonify({
+                    "feasible": False,
+                    "reason": "该范字只有一笔，无法演示“两笔被记成一笔”的拆分。",
+                }), 400
+            strokes = make_merged_sample(data["strokes"])
+            return jsonify({"character": data, "strokes": strokes,
+                            "kind": "merged"})
         strokes = make_sample(data["strokes"])
         return jsonify({"character": data, "strokes": strokes})
 
@@ -98,6 +108,41 @@ def create_app() -> Flask:
         # Domain failures (invalid limits, no solution) are returned as
         # feasible=false with a Chinese reason so the page can explain them.
         return jsonify(plan), 200
+
+    @app.post("/api/split")
+    def api_split():
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return jsonify({"feasible": False, "reason": "请求体必须是 JSON 对象"}), 400
+
+        threshold = body.get("threshold", DEFAULT_THRESHOLD)
+        try:
+            threshold = float(threshold)
+        except (TypeError, ValueError):
+            return jsonify({"feasible": False, "reason": "上限必须是数字"}), 400
+        if threshold < 0:
+            threshold = 0.0
+
+        model = body.get("model")
+        if not isinstance(model, list) or not model:
+            char_id = body.get("character_id") or "shi"
+            try:
+                model = load_character(str(char_id))["strokes"]
+            except FileNotFoundError:
+                return jsonify({"feasible": False,
+                                "reason": f"未知范字：{char_id}"}), 404
+
+        strokes = body.get("strokes", [])
+        if not isinstance(strokes, list):
+            return jsonify({"feasible": False, "reason": "strokes 必须是数组"}), 400
+
+        try:
+            stroke_index = int(body.get("stroke_index", -1))
+        except (TypeError, ValueError):
+            return jsonify({"feasible": False, "reason": "stroke_index 必须是整数"}), 400
+
+        result = build_split_plan(strokes, model, threshold, stroke_index)
+        return jsonify(result), 200
 
     return app
 

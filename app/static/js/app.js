@@ -30,7 +30,17 @@ const state = {
   draft: null, // in-progress raw points
   drawing: false,
   highlightUid: null,
+  // Trial-split preview: {strokeIndex, strokeUid, result} or null.
+  split: null,
+  splitBusy: false,
+  splitReqId: 0,
+  // Bumped whenever strokes are wholesale replaced (sample load / character
+  // switch); late responses from older loads must not overwrite new ink.
+  loadGen: 0,
 };
+
+const SEG_COLOR_A = "#0f9d8f";
+const SEG_COLOR_B = "#e08e0b";
 
 const $ = (id) => document.getElementById(id);
 const canvas = $("board");
@@ -211,9 +221,13 @@ async function selectCharacter(id, confirmChange) {
     return;
   }
   const data = await fetchJSON(`/api/characters/${id}`);
+  state.loadGen += 1;
+  state.planReqId += 1;
+  state.busy = false;
   state.charId = id;
   state.model = data.strokes;
   state.strokes = [];
+  state.split = null;
   state.plan = null;
   state.planStale = false;
   state.everPlanned = false;
@@ -222,6 +236,9 @@ async function selectCharacter(id, confirmChange) {
   $("adoptLog").innerHTML = "";
   document.querySelectorAll(".char-btn").forEach((b) =>
     b.classList.toggle("active", b.dataset.id === id));
+  renderSplitPanel();
+  $("splitNoSolution").hidden = true;
+  $("splitNoSolution").textContent = "";
   renderStrokeList();
   renderPlanPanel();
   renderStepList();
@@ -501,7 +518,59 @@ function render() {
     }
   }
 
+  drawSplitPreview(ctx);
+
   requestAnimationFrame(render);
+}
+
+/* --------------------------- split preview --------------------------- */
+
+function drawSplitPreview(c) {
+  const sp = state.split;
+  if (!sp) return;
+  // The target may have been removed/changed; invalidate defensively.
+  const target = state.strokes[sp.strokeIndex];
+  if (!target || target.uid !== sp.strokeUid) {
+    state.split = null;
+    renderSplitPanel();
+    return;
+  }
+  const r = sp.result;
+  const segA = r.segments[0].points;
+  const segB = r.segments[1].points;
+
+  c.save();
+  // Fade the original merged stroke so the two pieces stand out.
+  drawInk(c, target.points, "#8a8578", 20, 0.22);
+  // The two pieces keep every sample in order; draw them with distinct inks.
+  drawInk(c, segA, SEG_COLOR_A, 17, 0.98);
+  drawInk(c, segB, SEG_COLOR_B, 17, 0.98);
+
+  // Cut marker at the boundary sample (shared ordering, no point duplicated).
+  const cutPt = target.points[r.cut_index - 1];
+  const nextPt = target.points[r.cut_index] || cutPt;
+  const mx = (cutPt[0] + nextPt[0]) / 2;
+  const my = (cutPt[1] + nextPt[1]) / 2;
+  c.beginPath();
+  c.arc(mx, my, 16, 0, Math.PI * 2);
+  c.fillStyle = "#fff";
+  c.fill();
+  c.lineWidth = 4;
+  c.strokeStyle = "#22201c";
+  c.stroke();
+  c.beginPath();
+  c.moveTo(mx - 7, my);
+  c.lineTo(mx + 7, my);
+  c.strokeStyle = "#22201c";
+  c.lineWidth = 3;
+  c.stroke();
+
+  // Slot pills near the start of each piece.
+  drawPill(c, segA[0][0], Math.max(58, segA[0][1] - 62),
+    `第1段→范字${r.segments[0].slot + 1}`, SEG_COLOR_A);
+  drawPill(c, segB[0][0], Math.max(58, segB[0][1] - 62),
+    `第2段→范字${r.segments[1].slot + 1}`, SEG_COLOR_B);
+  c.restore();
 }
 
 /* ------------------------- pointer drawing ------------------------- */
@@ -560,6 +629,7 @@ function afterStrokesChanged() {
   // Once the teacher has asked for a revision, keep the suggestion live:
   // synchronously invalidate the old one, then recompute from actual order.
   const shouldReplan = state.everPlanned;
+  invalidateSplit();
   invalidatePlan();
   renderStrokeList();
   if (shouldReplan) requestPlan();
@@ -575,6 +645,143 @@ function invalidatePlan() {
   updatePlanButtons();
 }
 
+/* A split preview only stays valid while strokes, preserved marks, the
+   reference character and the threshold are untouched. */
+function invalidateSplit() {
+  // Bump the request generation so any in-flight trial-split response that
+  // resolves after the edit is discarded instead of repopulating the panel.
+  state.splitReqId += 1;
+  if (!state.split && !$("splitNoSolution").textContent) return;
+  state.split = null;
+  renderSplitPanel();
+}
+
+function renderSplitPanel() {
+  const box = $("splitResult");
+  const noSol = $("splitNoSolution");
+  noSol.hidden = true;
+  noSol.textContent = "";
+  if (!state.split) {
+    box.hidden = true;
+    return;
+  }
+  const r = state.split.result;
+  box.hidden = false;
+  $("splitTargetIndex").textContent = String(state.split.strokeIndex + 1);
+  $("splitCutIndex").textContent = String(r.cut_index);
+  $("splitSlotA").textContent = String(r.segments[0].slot + 1);
+  $("splitSlotB").textContent = String(r.segments[1].slot + 1);
+  $("splitPtsA").textContent = String(r.segments[0].points_count);
+  $("splitPtsB").textContent = String(r.segments[1].points_count);
+  $("splitDistA").textContent = r.segments[0].distance.toFixed(1);
+  $("splitDistB").textContent = r.segments[1].distance.toFixed(1);
+  $("splitWorst").textContent = r.worst_distance.toFixed(1);
+  $("splitTotal").textContent = String(r.resulting_stroke_count);
+  $("btnSplitAdopt").disabled = state.splitBusy;
+}
+
+async function requestSplit(index) {
+  const target = state.strokes[index];
+  if (!target) return;
+  if (target.preserved) {
+    toast("该笔已标记保留，保留笔不能试拆");
+    return;
+  }
+  if (state.strokes.length >= MAX_STROKES) {
+    toast(`已有 ${MAX_STROKES} 笔，拆分后会超过上限`);
+    return;
+  }
+  state.splitBusy = true;
+  $("btnSplitAdopt").disabled = true;
+  const reqId = ++state.splitReqId;
+  let data;
+  try {
+    const res = await fetch("/api/split", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        character_id: state.charId,
+        threshold: Number(state.threshold),
+        stroke_index: index,
+        strokes: state.strokes.map((s) => ({
+          uid: s.uid, points: s.points, preserved: !!s.preserved,
+        })),
+      }),
+    });
+    data = await res.json();
+  } catch (e) {
+    if (reqId === state.splitReqId) {
+      state.splitBusy = false;
+      toast("试拆请求失败：" + e.message);
+    }
+    return;
+  }
+  // A newer trial / an invalidating edit superseded this response.
+  if (reqId !== state.splitReqId) return;
+  state.splitBusy = false;
+  const noSol = $("splitNoSolution");
+  if (!data.feasible) {
+    state.split = null;
+    $("splitResult").hidden = true;
+    noSol.hidden = false;
+    noSol.textContent = data.reason || "无解";
+    return;
+  }
+  noSol.hidden = true;
+  state.split = { strokeIndex: index, strokeUid: target.uid, result: data };
+  renderSplitPanel();
+  toast("已在画布预览拆出的两笔，确认后可采纳");
+}
+
+function adoptSplit() {
+  const sp = state.split;
+  if (!sp || state.splitBusy) return;
+  const target = state.strokes[sp.strokeIndex];
+  if (!target || target.uid !== sp.strokeUid) {
+    toast("目标笔已变化，预览失效，请重新试拆");
+    invalidateSplit();
+    return;
+  }
+  const r = sp.result;
+  const segA = r.segments[0].points;
+  const segB = r.segments[1].points;
+  // Faithful partition check on the client too.
+  if (JSON.stringify(segA.concat(segB)) !== JSON.stringify(target.points)) {
+    toast("拆分点列与原笔不一致，已放弃采纳");
+    invalidateSplit();
+    return;
+  }
+  const replacement = [
+    {
+      uid: `u${state.uidCursor++}`,
+      points: segA,
+      preserved: true,
+      color: SEG_COLOR_A,
+      fromSplit: true,
+    },
+    {
+      uid: `u${state.uidCursor++}`,
+      points: segB,
+      preserved: true,
+      color: SEG_COLOR_B,
+      fromSplit: true,
+    },
+  ];
+  state.strokes.splice(sp.strokeIndex, 1, replacement[0], replacement[1]);
+  state.split = null;
+  renderSplitPanel();
+  // Adoption must always recompute the revision over the new stroke order,
+  // even if the teacher never pressed "求最优修订" before trying the split.
+  state.everPlanned = true;
+  toast("已采纳：该笔替换为两段并标为保留，按新笔序重新求解");
+  afterStrokesChanged();
+}
+
+function cancelSplit() {
+  state.split = null;
+  renderSplitPanel();
+}
+
 function renderStrokeList() {
   const ul = $("strokeList");
   ul.innerHTML = "";
@@ -583,8 +790,10 @@ function renderStrokeList() {
 
   state.strokes.forEach((s, i) => {
     const li = document.createElement("li");
+    const isSplitTarget = state.split && state.split.strokeUid === s.uid;
     li.className = "stroke-item" + (s.preserved ? " preserved" : "") +
-      (state.highlightUid === s.uid ? " highlight" : "");
+      (state.highlightUid === s.uid ? " highlight" : "") +
+      (isSplitTarget ? " split-target" : "");
 
     const badge = document.createElement("span");
     badge.className = "order";
@@ -593,7 +802,8 @@ function renderStrokeList() {
 
     const meta = document.createElement("div");
     meta.className = "meta";
-    meta.innerHTML = `<div class="name">第 ${i + 1} 笔${s.preserved ? " · 已保留" : ""}</div>
+    meta.innerHTML = `<div class="name">第 ${i + 1} 笔${s.preserved ? " · 已保留" : ""}${
+      s.fromSplit ? " · 拆出" : ""}</div>
       <div class="sub">${s.points.length} 个坐标点</div>`;
 
     const label = document.createElement("label");
@@ -607,6 +817,29 @@ function renderStrokeList() {
     });
     label.appendChild(cb);
     label.appendChild(document.createTextNode("保留"));
+
+    const splitBtn = document.createElement("button");
+    splitBtn.type = "button";
+    splitBtn.className = "link-split";
+    splitBtn.textContent = "试拆";
+    if (s.preserved) {
+      splitBtn.disabled = true;
+      splitBtn.title = "保留笔不能试拆";
+    } else if (s.points.length < 4) {
+      splitBtn.disabled = true;
+      splitBtn.title = "至少需要 4 个采样点（两段各至少 2 点）";
+    } else if (state.strokes.length >= MAX_STROKES) {
+      splitBtn.disabled = true;
+      splitBtn.title = `拆分后会超过 ${MAX_STROKES} 笔上限`;
+    } else {
+      splitBtn.title = "把这一笔试拆成两笔";
+    }
+    splitBtn.addEventListener("click", () => {
+      // Resolve the index at click time: an async re-render can have replaced
+      // this row, so a closure-captured index could point at a stale stroke.
+      const cur = state.strokes.findIndex((x) => x.uid === s.uid);
+      if (cur >= 0) requestSplit(cur);
+    });
 
     const del = document.createElement("button");
     del.type = "button";
@@ -625,6 +858,7 @@ function renderStrokeList() {
     li.appendChild(badge);
     li.appendChild(meta);
     li.appendChild(label);
+    li.appendChild(splitBtn);
     li.appendChild(del);
 
     li.addEventListener("mouseenter", () => { state.highlightUid = s.uid; });
@@ -765,8 +999,13 @@ function addAdoptLog(label) {
 
 async function loadSample() {
   if (!state.charId) return;
+  const gen = ++state.loadGen;
   try {
+    // Supersede any plan request still in flight from earlier edits so its
+    // late response cannot overwrite the freshly loaded sample.
+    state.planReqId += 1;
     const data = await fetchJSON(`/api/sample/${state.charId}`);
+    if (gen !== state.loadGen) return; // a newer load/switch superseded us
     state.colorCursor = 0;
     state.uidCursor = 1;
     state.strokes = data.strokes.map((s) => ({
@@ -777,12 +1016,49 @@ async function loadSample() {
     }));
     state.everPlanned = false;
     state.planStale = false;
+    state.split = null;
+    renderSplitPanel();
+    $("splitNoSolution").hidden = true;
+    $("splitNoSolution").textContent = "";
     renderStrokeList();
     $("canvasHint").style.opacity = "0";
     await requestPlan();
     toast("已填入含移笔 / 删笔 / 缺笔错误的示例");
   } catch (e) {
     toast("示例载入失败：" + e.message);
+  }
+}
+
+async function loadMergedSample() {
+  if (!state.charId) return;
+  const gen = ++state.loadGen;
+  try {
+    state.planReqId += 1;
+    const data = await fetchJSON(`/api/sample/${state.charId}?merged=1`);
+    if (gen !== state.loadGen) return;
+    if (data.feasible === false) {
+      toast(data.reason || "该范字无法演示并笔拆分");
+      return;
+    }
+    state.colorCursor = 0;
+    state.uidCursor = 1;
+    state.strokes = data.strokes.map((s, i) => ({
+      uid: s.uid,
+      points: s.points,
+      preserved: false,
+      color: PALETTE[(i * 2) % PALETTE.length],
+    }));
+    state.everPlanned = false;
+    state.planStale = false;
+    state.split = null;
+    renderSplitPanel();
+    $("splitNoSolution").hidden = true;
+    $("splitNoSolution").textContent = "";
+    renderStrokeList();
+    $("canvasHint").style.opacity = "0";
+    toast("已填入并笔示例：第 1 笔实际含两笔，请对它点“试拆”");
+  } catch (e) {
+    toast("并笔示例载入失败：" + e.message);
   }
 }
 
@@ -793,6 +1069,7 @@ $("threshold").addEventListener("input", (e) => {
   $("thresholdValue").textContent = e.target.value;
 });
 $("threshold").addEventListener("change", () => {
+  invalidateSplit();
   if (!state.everPlanned) return;
   invalidatePlan();
   requestPlan();
@@ -812,6 +1089,9 @@ $("btnClear").addEventListener("click", () => {
   $("canvasHint").style.opacity = "1";
 });
 $("btnSample").addEventListener("click", loadSample);
+$("btnMergedSample").addEventListener("click", loadMergedSample);
+$("btnSplitAdopt").addEventListener("click", adoptSplit);
+$("btnSplitCancel").addEventListener("click", cancelSplit);
 
 $("btnPlay").addEventListener("click", () => {
   if (!state.plan || !state.plan.steps.length) return;

@@ -40,6 +40,7 @@
         <button id="btnUndo" class="btn" type="button">撤销上一笔</button>
         <button id="btnClear" class="btn" type="button">清空笔迹</button>
         <button id="btnSample" class="btn btn-ghost" type="button">填入示例笔迹（含典型错误）</button>
+        <button id="btnMergedSample" class="btn btn-ghost" type="button">填入并笔示例（两笔被记成一笔）</button>
         <span class="stroke-count"><b id="strokeCount">0</b>/10 笔 · 每笔≤64点</span>
       </div>
     </section>
@@ -55,6 +56,51 @@
         <div id="emptyStrokes" class="empty">还没有笔迹，可在画布书写，或点“填入示例笔迹”。</div>
       </section>
 
+      <section class="card split-card">
+        <div class="row-between">
+          <h2>试拆一笔（少抬一次笔）</h2>
+          <span class="muted">在下方列表给未保留的笔点“试拆”</span>
+        </div>
+
+        <div id="splitHint" class="muted split-hint">
+          两笔被画布记成一笔时，选一笔<b>未标保留</b>的实写笔试拆：系统按书写方向的离散
+          Fréchet 距离找切点，两段各至少两个点、完整保留全部采样点，并分别匹配相邻的两笔范字。
+        </div>
+
+        <div id="splitNoSolution" class="notice notice-error" hidden></div>
+
+        <div id="splitResult" class="split-result" hidden>
+          <div class="split-title">
+            第 <b id="splitTargetIndex">–</b> 笔试拆预览
+            <span class="split-cut">切点在第 <b id="splitCutIndex">–</b> 个采样点之后</span>
+          </div>
+          <ul class="split-segments">
+            <li>
+              <span class="seg-dot seg-a"></span>
+              <div class="meta">
+                <div class="name">第 1 段 → 范字第 <b id="splitSlotA">–</b> 笔</div>
+                <div class="sub"><b id="splitPtsA">–</b> 个点 · Fréchet <b id="splitDistA">–</b></div>
+              </div>
+            </li>
+            <li>
+              <span class="seg-dot seg-b"></span>
+              <div class="meta">
+                <div class="name">第 2 段 → 范字第 <b id="splitSlotB">–</b> 笔</div>
+                <div class="sub"><b id="splitPtsB">–</b> 个点 · Fréchet <b id="splitDistB">–</b></div>
+              </div>
+            </li>
+          </ul>
+          <div class="split-metric">
+            两段较大距离 <b id="splitWorst">–</b>（已在可行切法中取最小）·
+            采纳后共 <b id="splitTotal">–</b> 笔，两段都会标为保留
+          </div>
+          <div class="split-actions">
+            <button id="btnSplitAdopt" class="btn btn-split" type="button">采纳试拆结果</button>
+            <button id="btnSplitCancel" class="btn" type="button">取消预览</button>
+          </div>
+        </div>
+      </section>
+
       <section class="card plan-card">
         <div class="row-between">
           <h2>最少动作修订</h2>
@@ -62,7 +108,7 @@
         </div>
 
         <div id="staleNotice" class="notice notice-warn" hidden>
-          笔迹或保留项已改变，旧建议已失效，请重新求解。
+          范字、笔迹、保留项或上限已改变，旧建议与试拆预览均已失效，请重新求解。
         </div>
 
         <div id="noSolution" class="notice notice-error" hidden></div>

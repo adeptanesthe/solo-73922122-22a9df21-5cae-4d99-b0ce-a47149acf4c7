@@ -125,6 +125,66 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(p.status_code, 400)
         self.assertFalse(p.get_json()["feasible"])
 
+    def test_split_endpoint_merged_sample(self):
+        sample = self.client.get("/api/sample/shi?merged=1").get_json()
+        self.assertEqual(sample["kind"], "merged")
+        strokes = sample["strokes"]
+        r = self.client.post("/api/split", json={
+            "character_id": "shi", "threshold": 180,
+            "strokes": strokes, "stroke_index": 0,
+        }).get_json()
+        self.assertTrue(r["feasible"], r.get("reason"))
+        self.assertEqual([s["slot"] for s in r["segments"]], [0, 1])
+        rebuilt = r["segments"][0]["points"] + r["segments"][1]["points"]
+        self.assertEqual(rebuilt, strokes[0]["points"])
+        self.assertEqual(r["resulting_stroke_count"], 2)
+
+    def test_split_endpoint_rejects_preserved_and_cap(self):
+        sample = self.client.get("/api/sample/shi?merged=1").get_json()
+        strokes = sample["strokes"]
+        strokes[0]["preserved"] = True
+        r = self.client.post("/api/split", json={
+            "character_id": "shi", "threshold": 180,
+            "strokes": strokes, "stroke_index": 0,
+        }).get_json()
+        self.assertFalse(r["feasible"])
+        self.assertIn("保留", r["reason"])
+
+        ten = [{"uid": str(i), "preserved": False,
+                "points": [[10, 10], [20, 20], [30, 30], [40, 40]]} for i in range(10)]
+        r2 = self.client.post("/api/split", json={
+            "character_id": "shi", "threshold": 10 ** 9,
+            "strokes": ten, "stroke_index": 0,
+        }).get_json()
+        self.assertFalse(r2["feasible"])
+        self.assertIn("10 笔", r2["reason"])
+
+    def test_split_then_adopt_then_plan_via_http(self):
+        sample = self.client.get("/api/sample/mu?merged=1").get_json()
+        strokes = sample["strokes"]  # 3 strokes: merged(0+1), then slot 2, slot 3
+        sp = self.client.post("/api/split", json={
+            "character_id": "mu", "threshold": 180,
+            "strokes": strokes, "stroke_index": 0,
+        }).get_json()
+        self.assertTrue(sp["feasible"], sp.get("reason"))
+        adopted = [
+            {"uid": "p0", "points": sp["segments"][0]["points"], "preserved": True},
+            {"uid": "p1", "points": sp["segments"][1]["points"], "preserved": True},
+        ] + [dict(s, preserved=False) for s in strokes[1:]]
+        plan = self.client.post("/api/plan", json={
+            "character_id": "mu", "threshold": 180, "strokes": adopted,
+        }).get_json()
+        self.assertTrue(plan["feasible"], plan.get("reason"))
+        self.assertEqual(plan["cost"], 0)
+
+    def test_split_endpoint_bad_index(self):
+        r = self.client.post("/api/split", json={
+            "character_id": "shi", "threshold": 180,
+            "strokes": [{"uid": "x", "points": [[1, 1], [2, 2], [3, 3], [4, 4]]}],
+            "stroke_index": 5,
+        }).get_json()
+        self.assertFalse(r["feasible"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -34,7 +34,8 @@ const dom = await JSDOM.fromURL(BASE, {
   virtualConsole: vc,
   beforeParse(window) {
     window.fetch = (u, opt) => fetch(new URL(u, BASE), opt);
-    window.performance = globalThis.performance;
+    // Newer jsdom versions expose a read-only performance getter.
+    try { window.performance = globalThis.performance; } catch (_) { /* noop */ }
     window.confirm = () => true;
     window.HTMLCanvasElement.prototype.getContext = () => makeCtxProxy();
     window.HTMLCanvasElement.prototype.getBoundingClientRect = () => ({
@@ -163,6 +164,109 @@ try {
 
   // Stroke delete button also invalidates.
   results.push("stroke rows rendered=" + document.querySelectorAll("#strokeList .stroke-item").length);
+
+  // ----------------------- trial-split flow -----------------------
+  // Clear any preserve marks left by the earlier conflict demo so the merged
+  // sample's first stroke is a normal non-preserved stroke, and reset the
+  // threshold the earlier no-solution demo may have lowered.
+  for (const cb of document.querySelectorAll("#strokeList input[type=checkbox]")) {
+    if (cb.checked) { cb.checked = false; cb.dispatchEvent(new window.Event("change", { bubbles: true })); }
+  }
+  const thrInput = $("threshold");
+  if (thrInput.value !== "180") {
+    thrInput.value = "180";
+    thrInput.dispatchEvent(new window.Event("input", { bubbles: true }));
+    thrInput.dispatchEvent(new window.Event("change", { bubbles: true }));
+  }
+  await sleep(150);
+
+  // Load the merged-stroke demo: stroke 1 actually contains two reference
+  // strokes recorded as one continuous gesture.
+  $("btnMergedSample").click();
+  await waitFor(() => document.querySelectorAll("#strokeList .stroke-item").length > 0,
+    8000, "merged sample strokes");
+  // The list re-renders after the fetch resolves; wait until the rows really
+  // belong to the merged sample (its first stroke carries uid "m0"), so a
+  // click cannot land on a stale pre-load button still in the DOM.
+  await waitFor(() => dom.window.eval("state.strokes[0] && state.strokes[0].uid") === "m0",
+    8000, "merged sample applied to state");
+  const mergedCount = document.querySelectorAll("#strokeList .stroke-item").length;
+  results.push(`merged sample loaded: ${mergedCount} strokes`);
+
+  // Every non-preserved row exposes a 试拆 button; preserved rows do not.
+  const splitBtns = () => Array.from(document.querySelectorAll("#strokeList .link-split"));
+  if (!splitBtns().length) throw new Error("no 试拆 buttons rendered");
+  if (splitBtns().some((b) => b.disabled))
+    throw new Error("merged sample strokes are non-preserved, 试拆 must be enabled");
+  results.push("试拆 buttons enabled on non-preserved rows");
+
+  splitBtns()[0].click();
+  await waitFor(() => !$("splitResult").hidden, 8000, "split preview panel");  results.push(
+    `split preview: target=第${$("splitTargetIndex").textContent}笔 切点=${$("splitCutIndex").textContent} ` +
+    `槽位=${$("splitSlotA").textContent},${$("splitSlotB").textContent} ` +
+    `点数=${$("splitPtsA").textContent}+${$("splitPtsB").textContent} ` +
+    `worst=${$("splitWorst").textContent}`
+  );
+  if ($("splitSlotA").textContent !== "1" || $("splitSlotB").textContent !== "2")
+    throw new Error("split must match adjacent reference slots 1 and 2");
+  if (parseInt($("splitPtsA").textContent, 10) < 2 ||
+      parseInt($("splitPtsB").textContent, 10) < 2)
+    throw new Error("each split piece needs >= 2 points");
+  if (parseInt($("splitTotal").textContent, 10) !== mergedCount + 1)
+    throw new Error("resulting stroke count mismatch");
+
+  // Changing the threshold invalidates the preview.
+  const thr = $("threshold");
+  thr.value = String(parseInt(thr.value, 10) - 10);
+  thr.dispatchEvent(new window.Event("change", { bubbles: true }));
+  await sleep(80);
+  if (!$("splitResult").hidden) throw new Error("split preview must invalidate on threshold change");
+  results.push("threshold change invalidated the split preview");
+
+  // Re-request the preview, then adopt it.
+  splitBtns()[0].click();
+  await waitFor(() => !$("splitResult").hidden, 8000, "split preview again");
+  const beforeAdopt = document.querySelectorAll("#strokeList .stroke-item").length;
+  $("btnSplitAdopt").click();
+  await waitFor(
+    () => document.querySelectorAll("#strokeList .stroke-item").length === beforeAdopt + 1,
+    8000, "stroke count grows by one after adopt"
+  );
+  results.push(`adopt split: ${beforeAdopt} -> ${beforeAdopt + 1} strokes, both marked preserved`);
+  const checks = document.querySelectorAll("#strokeList input[type=checkbox]");
+  if (!checks[0].checked || !checks[1].checked)
+    throw new Error("both split pieces must be marked preserved");
+  // Adopted pieces show 拆出 in their row meta.
+  const metas = Array.from(document.querySelectorAll("#strokeList .meta .name")).map((e) => e.textContent);
+  if (!metas[0].includes("拆出") || !metas[1].includes("拆出"))
+    throw new Error("split pieces should be tagged 拆出");
+
+  // Replan over the new actual stroke order reaches a zero-cost revision.
+  await waitFor(() => !$("planSummary").hidden && $("costTotal").textContent === "0",
+    8000, "zero-cost plan after split adoption");
+  results.push("replan after adoption: cost=0 (" +
+    `移${$("cntMove").textContent} 删${$("cntDel").textContent} 补${$("cntAdd").textContent})`);
+
+  // The adopted pieces are preserved: their rows must not offer 试拆.
+  if (splitBtns().slice(0, 2).some((b) => !b.disabled))
+    throw new Error("preserved split pieces must not be splittable again");
+
+  // No-solution path: a very tight threshold yields an inline Chinese reason.
+  thr.value = "20";
+  thr.dispatchEvent(new window.Event("input", { bubbles: true }));
+  thr.dispatchEvent(new window.Event("change", { bubbles: true }));
+  await sleep(300); // let the threshold settle so no in-flight request races us
+  // find a non-preserved row with an enabled 试拆 button (pieces 3+ are not preserved)
+  const enabled = splitBtns().find((b) => !b.disabled);
+  if (enabled) {
+    enabled.click();
+    await waitFor(() => !$("splitNoSolution").hidden &&
+      $("splitNoSolution").textContent.includes("无解"), 8000, "split no-solution notice");
+    results.push("tight threshold split -> 无解: " + $("splitNoSolution").textContent.slice(0, 22) + "…");
+  }
+  thr.value = "180";
+  thr.dispatchEvent(new window.Event("input", { bubbles: true }));
+  thr.dispatchEvent(new window.Event("change", { bubbles: true }));
 
   if (errors.length) {
     console.log(results.join("\n"));

@@ -59,3 +59,37 @@ def make_sample(model: Sequence[Sequence[float]], seed: int = 20261124) -> List[
         uid += 1
     strokes.append({"uid": f"s{uid}", "points": _scribble(rng), "preserved": False})
     return strokes
+
+
+def make_merged_sample(
+    model: Sequence[Sequence[float]], seed: int = 20261125
+) -> List[Dict[str, Any]]:
+    """Return strokes where two reference strokes were recorded as ONE stroke.
+
+    Simulates the "forgot to lift the pen" case: jittered copies of the first
+    two reference strokes are concatenated into a single polyline (the pen
+    stays down, so a sharp jump connects them), and the remaining reference
+    strokes follow as separate jittered strokes.  A successful trial split
+    must recover adjacent reference slots 0 and 1 while preserving every
+    recorded sample in order.
+    """
+    if len(model) < 2:
+        raise ValueError("merged sample needs a character with at least 2 strokes")
+
+    rng = random.Random(seed)
+    merged_a = _jitter(model[0], rng)
+    merged_b = _jitter(model[1], rng)
+    # The canvas records a continuous gesture: simply concatenate the samples.
+    merged = [list(p) for p in merged_a] + [list(p) for p in merged_b]
+
+    strokes: List[Dict[str, Any]] = [{
+        "uid": "m0", "points": merged, "preserved": False,
+    }]
+    uid = 1
+    for i in range(2, len(model)):
+        strokes.append({
+            "uid": f"m{uid}", "points": _jitter(model[i], rng),
+            "preserved": False,
+        })
+        uid += 1
+    return strokes
